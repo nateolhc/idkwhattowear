@@ -296,9 +296,16 @@
       if (!files.length) return;
       if (fileInput) fileInput.value = '';
 
-      // Always append photos to the existing collection. No prompts, no surprise
-      // wipes. To clear everything (manual items, photos, ratings), use Start Over.
       if (!Array.isArray(state.outfitPhotos)) state.outfitPhotos = [];
+
+      // First photo upload of this session: silently clear any lingering manual
+      // items (e.g. demo data from "See a sample report") so they don't pollute
+      // the photo-mode analysis. Subsequent uploads append without clearing.
+      if (state.outfitPhotos.length === 0 && state.items.length > 0) {
+        state.items = [];
+        if (state.outfits) state.outfits.length = 0;
+        if (state.ratings) Object.keys(state.ratings).forEach(k => delete state.ratings[k]);
+      }
 
       const progress = document.getElementById('photoProgress');
       if (progress) progress.style.display = 'block';
