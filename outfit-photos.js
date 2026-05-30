@@ -222,10 +222,23 @@
 
         injectPhotoGallery(photos);
 
-        // Remove foundation pieces card in photo-only mode (needs item names)
+        // In photo-only mode, suppress recommendations that depend on item
+        // metadata (categories, names, tiers) — they generate false positives
+        // because we don't know the garment type from a colour alone.
         if (photoOnly) {
-          document.querySelectorAll('.opt-card.gap').forEach(card => {
-            if (/foundation pieces? missing/i.test(card.textContent || '')) card.remove();
+          document.querySelectorAll('#optList .opt-card').forEach(card => {
+            const t = (card.textContent || '').toLowerCase();
+            const isFalsePositive =
+              /no .* on record/.test(t) ||                  // "No bottoms on record"
+              /foundation pieces? missing/.test(t) ||       // foundation list
+              /top[- ]to[- ]bottom ratio/.test(t) ||        // ratio cards
+              /skewed ratio/.test(t) ||
+              /top[- ]heavy|top[- ]light/.test(t) ||
+              /trouser[- ]forward/.test(t) ||
+              /gentle edit is overdue/.test(t) ||           // tier-based
+              /closet clean[- ]?out/.test(t) ||
+              /zero .* on file/.test(t);
+            if (isFalsePositive) card.remove();
           });
         }
       };
@@ -342,17 +355,54 @@
     }
 
     function extractDominantColors(ctx, w, h) {
+      // Sample only the inner 70% horizontally and 80% vertically of the frame.
+      // Clothing is almost always centred; edges are mostly background.
+      const padX = Math.floor(w * 0.15);
+      const padY = Math.floor(h * 0.10);
       const data = ctx.getImageData(0, 0, w, h).data;
       const buckets = {};
-      for (let i = 0; i < data.length; i += 16) {
-        const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
-        if (a < 200) continue;
-        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-        if (lum > 242 || lum < 16) continue;
-        const key = `${r >> 5}|${g >> 5}|${b >> 5}`;
-        buckets[key] = (buckets[key] || 0) + 1;
+      const cx = w / 2, cy = h * 0.55; // bias centre slightly down — clothing sits below the face
+      const maxDist = Math.hypot(w / 2, h / 2);
+
+      for (let y = padY; y < h - padY; y += 2) {
+        for (let x = padX; x < w - padX; x += 2) {
+          const i = (y * w + x) * 4;
+          const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+          if (a < 200) continue;
+
+          // Drop extreme highlights and deep shadows
+          const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+          if (lum > 240 || lum < 18) continue;
+
+          // Drop low-saturation light pixels — typical of walls, paper, white furniture
+          const max = Math.max(r, g, b), min = Math.min(r, g, b);
+          const sat = max ? (max - min) / max : 0;
+          if (sat < 0.10 && lum > 160) continue;
+
+          // Skin tone filter — broadly r > g > b with a warm orange-pink cast.
+          // Calibrated against typical skin in well-lit photos across tones.
+          const isSkin =
+            r > g && g >= b &&
+            (r - b) > 28 && (r - b) < 130 &&
+            (g - b) >= 6 && (g - b) < 70 &&
+            sat > 0.18 && sat < 0.65 &&
+            lum > 80 && lum < 230;
+          if (isSkin) continue;
+
+          // Centre weighting — pixels near the visual centre count more.
+          const dx = (x - cx) / maxDist;
+          const dy = (y - cy) / maxDist;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          const weight = Math.max(0.25, 1 - dist * 1.2);
+
+          // Quantize into 32-level buckets per channel
+          const key = `${r >> 5}|${g >> 5}|${b >> 5}`;
+          buckets[key] = (buckets[key] || 0) + weight;
+        }
       }
-      const top = Object.entries(buckets).sort((a, b) => b[1] - a[1]).slice(0, 12);
+
+      // Take the top buckets, map each to its nearest named colour, aggregate
+      const top = Object.entries(buckets).sort((a, b) => b[1] - a[1]).slice(0, 14);
       const byName = {};
       for (const [key, count] of top) {
         const [rq, gq, bq] = key.split('|').map(Number);
