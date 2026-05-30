@@ -283,15 +283,8 @@
       if (!files.length) return;
       if (fileInput) fileInput.value = '';
 
-      // Only prompt-and-replace when switching FROM manual mode INTO photo mode.
-      // Photo-to-photo uploads just append to the existing collection.
-      if (state.items.length > 0) {
-        const ok = confirm(`You currently have ${state.items.length} manually-entered items. Switching to photo mode will replace them. Continue?`);
-        if (!ok) return;
-        state.items = [];
-        if (state.outfits) state.outfits.length = 0;
-        if (state.ratings) Object.keys(state.ratings).forEach(k => delete state.ratings[k]);
-      }
+      // Always append photos to the existing collection. No prompts, no surprise
+      // wipes. To clear everything (manual items, photos, ratings), use Start Over.
       if (!Array.isArray(state.outfitPhotos)) state.outfitPhotos = [];
 
       const progress = document.getElementById('photoProgress');
