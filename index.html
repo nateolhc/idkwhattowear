@@ -1400,6 +1400,8 @@
     wrappedMode: 'light',
   };
 
+  window.__idkBridge = { state, save, COLORS, colorHex, uid };
+
   function uid() { return Math.random().toString(36).slice(2, 9); }
 
   function goTo(screen) {
@@ -3439,5 +3441,6 @@
   }
   init();
 </script>
+   <script src="outfit-photos.js"></script>
 </body>
 </html>
