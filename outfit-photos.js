@@ -6,27 +6,20 @@
 // dominant colours from each photo client-side and feeds them into the existing
 // analysis pipeline.
 //
-// INSTALL (see outfit-photos-install.md):
-//   1. In your index.html, find:    const state = {
-//      And right AFTER its closing }; (and the matching const declaration line),
-//      add this single line:
+// INSTALL (in your index.html):
+//   1. After the const state = { ... }; declaration, add:
 //        window.__idkBridge = { state, save, COLORS, colorHex, uid };
-//
-//   2. Just before </body> in index.html, add:
+//   2. Just before </body>, add:
 //        <script src="outfit-photos.js"></script>
-//
-// That's it. The plugin handles its own CSS, DOM insertion, and analysis adaptations.
 // ─────────────────────────────────────────────────────────────────────────────
 
 (function () {
   'use strict';
 
-  // ─── Wait until the host script has run and exposed its bridge ───
   function whenReady(cb) {
     if (window.__idkBridge && window.__idkBridge.state && window.__idkBridge.COLORS) cb();
     else setTimeout(() => whenReady(cb), 50);
   }
-
   whenReady(init);
 
   function init() {
@@ -37,7 +30,6 @@
     const uid = bridge.uid;
     const save = bridge.save;
 
-    // Initialise the photos array on state if not already present
     if (!Array.isArray(state.outfitPhotos)) state.outfitPhotos = [];
 
     // ─── 1. Inject CSS ───
@@ -92,7 +84,7 @@
       btn.className = 'tab';
       btn.dataset.tab = 'photos';
       btn.textContent = 'Upload outfit photos';
-      btn.onclick = () => activateTab('photos');
+      btn.onclick = () => window.switchTab('photos');
       tabsRow.appendChild(btn);
     }
 
@@ -108,7 +100,6 @@
           <p><strong>Drop outfit photos here, or click to browse</strong></p>
           <p class="small" style="font-family:var(--display);font-style:italic">Bring 10–30 photos of looks you've actually worn</p>
           <p class="small" style="font-family:var(--display);font-style:italic">JPG · PNG · WebP · HEIC accepted</p>
-          <p class="small" style="font-family:var(--display);font-style:italic;color:var(--w-accent);margin-top:6px">Uploading replaces your current wardrobe.</p>
           <input type="file" id="photoInput" accept="image/*" multiple style="display:none">
         </div>
         <div class="photo-progress" id="photoProgress" style="display:none"></div>
@@ -117,13 +108,11 @@
       `;
       csvTab.parentNode.insertBefore(photosTab, csvTab.nextSibling);
 
-      // Wire up drop zone and file input
       const dropZone = photosTab.querySelector('#photoDropZone');
       const fileInput = photosTab.querySelector('#photoInput');
       dropZone.addEventListener('click', () => fileInput.click());
       fileInput.addEventListener('change', e => handlePhotoUpload(e.target.files, fileInput));
 
-      // Native drag-and-drop
       ['dragenter', 'dragover'].forEach(evt => {
         dropZone.addEventListener(evt, e => {
           e.preventDefault();
@@ -144,20 +133,17 @@
       });
     }
 
-    // ─── 4. Hook into the existing switchTab so the new tab toggles correctly ───
+    // ─── 4. Hook into switchTab ───
     const originalSwitchTab = window.switchTab;
     window.switchTab = function (tab) {
-      // Run original (handles 'manual' and 'csv')
       if (typeof originalSwitchTab === 'function') originalSwitchTab(tab);
-      // Update tab buttons including ours
       document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
       const photosTab = document.getElementById('tab-photos');
       if (photosTab) photosTab.classList.toggle('hidden', tab !== 'photos');
       if (tab === 'photos') renderPhotoGrid();
     };
-    function activateTab(tab) { window.switchTab(tab); }
 
-    // ─── 5. Hook submitWardrobe so photos count as valid input ───
+    // ─── 5. Hook submitWardrobe — photos also count ───
     const originalSubmit = window.submitWardrobe;
     window.submitWardrobe = function () {
       const validItems = state.items.filter(i => i.name && i.color && i.tier);
@@ -171,7 +157,7 @@
       alert('Add at least three complete items or three outfit photos before producing a report.');
     };
 
-    // ─── 6. Hook updateCount so total reflects photos too ───
+    // ─── 6. Hook updateCount ───
     const originalUpdate = window.updateCount;
     window.updateCount = function () {
       const itemCount = state.items.filter(i => i.name && i.color && i.tier).length;
@@ -184,32 +170,28 @@
     const originalRender = window.renderAnalysis;
     if (typeof originalRender === 'function') {
       window.renderAnalysis = function () {
-        // Synthesize "ghost items" from photos so existing analysis machinery just works
         const photos = (state.outfitPhotos || []).filter(p => p.image);
-        const photoColors = [];
-        photos.forEach(p => (p.colors || []).forEach(c => photoColors.push(c)));
-
-        // Stash real items, inject synthetic photo-derived items if needed
         const realItems = state.items;
-        const photoItems = photoColors.map(c => ({
-          id: 'photo-' + Math.random().toString(36).slice(2),
-          category: 'tops', name: 'outfit colour', tier: 'decent',
-          color: c, brand: '', occasion: []
-        }));
+        const photoOnly = realItems.length === 0 && photos.length > 0;
 
-        if (photos.length > 0 && realItems.length === 0) {
-          // Photo-only mode — temporarily replace items with photo-derived ones
+        // In photo-only mode, synthesize colour-bearing ghost items so the
+        // existing analysis pipeline has something to work with.
+        if (photoOnly) {
+          const photoItems = [];
+          photos.forEach(p => (p.colors || []).forEach(c => {
+            photoItems.push({
+              id: 'photo-' + Math.random().toString(36).slice(2),
+              category: 'tops', name: 'outfit colour', tier: 'decent',
+              color: c, brand: '', occasion: []
+            });
+          }));
           state.items = photoItems;
         }
 
-        // Run the original analysis
         originalRender();
-
-        // Restore real items
         state.items = realItems;
 
-        // Hide brand-, name-, tier-, occasion-dependent sections in photo mode
-        const photoOnly = realItems.length === 0 && photos.length > 0;
+        // Hide brand-, name-, tier-, occasion-dependent sections
         const brandCard = document.querySelector('.chart-card.c2');
         const catColorWrap = document.getElementById('catColorCharts');
         const catChart = document.getElementById('catChart');
@@ -227,7 +209,7 @@
         if (pairingsSection) pairingsSection.style.display = photoOnly ? 'none' : '';
         if (pairingsCard) pairingsCard.style.display = photoOnly ? 'none' : '';
 
-        // Update stat labels for photo mode
+        // Update stat labels
         const labels = document.querySelectorAll('#screen-analysis .stat .label');
         if (labels.length === 4) {
           labels[0].textContent = photoOnly ? 'Outfits' : 'Total pieces';
@@ -238,10 +220,9 @@
         if (photoOnly && statTotal) statTotal.textContent = photos.length;
         if (photoOnly && statFaves) statFaves.textContent = photos.length;
 
-        // Insert outfit photo gallery at the top of the analysis if photos exist
         injectPhotoGallery(photos);
 
-        // Remove foundation pieces card in photo-only mode (it relies on item names)
+        // Remove foundation pieces card in photo-only mode (needs item names)
         if (photoOnly) {
           document.querySelectorAll('.opt-card.gap').forEach(card => {
             if (/foundation pieces? missing/i.test(card.textContent || '')) card.remove();
@@ -251,7 +232,6 @@
     }
 
     function injectPhotoGallery(photos) {
-      // Remove any existing gallery first
       const existing = document.getElementById('photo-gallery-block');
       if (existing) existing.remove();
       if (!photos.length) return;
@@ -293,26 +273,26 @@
         try { localStorage.removeItem('idkwtw-state'); } catch (e) {}
         state.items = [];
         state.outfitPhotos = [];
-        // Best-effort: delegate to original to reset its other state
         try { originalStartOver(); } catch (e) {}
       };
     }
 
-    // ─── 9. Photo upload + colour extraction pipeline ───
+    // ─── 9. Photo upload pipeline ───
     async function handlePhotoUpload(fileList, fileInput) {
       const files = Array.from(fileList || []);
       if (!files.length) return;
       if (fileInput) fileInput.value = '';
 
-      const existing = state.items.length + (state.outfitPhotos || []).length;
-      if (existing > 0) {
-        const ok = confirm(`You currently have ${existing} entries logged. Uploading replaces them. Continue?`);
+      // Only prompt-and-replace when switching FROM manual mode INTO photo mode.
+      // Photo-to-photo uploads just append to the existing collection.
+      if (state.items.length > 0) {
+        const ok = confirm(`You currently have ${state.items.length} manually-entered items. Switching to photo mode will replace them. Continue?`);
         if (!ok) return;
         state.items = [];
-        state.outfitPhotos = [];
         if (state.outfits) state.outfits.length = 0;
         if (state.ratings) Object.keys(state.ratings).forEach(k => delete state.ratings[k]);
       }
+      if (!Array.isArray(state.outfitPhotos)) state.outfitPhotos = [];
 
       const progress = document.getElementById('photoProgress');
       if (progress) progress.style.display = 'block';
@@ -347,7 +327,6 @@
       const img = new Image();
       await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = dataUrl; });
 
-      // Resize to 800px max longest side
       const maxDim = 800;
       const ratio = Math.min(1, maxDim / Math.max(img.width, img.height));
       const w = Math.max(1, Math.round(img.width * ratio));
@@ -442,10 +421,7 @@
       }
     }
 
-    // Expose for debugging
     window.__photoPluginRender = renderPhotoGrid;
-
-    // Re-render the photo grid on initial load (covers reload-with-saved-photos case)
     renderPhotoGrid();
     if (typeof window.updateCount === 'function') window.updateCount();
   }
