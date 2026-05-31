@@ -174,17 +174,43 @@
         const realItems = state.items;
         const photoOnly = realItems.length === 0 && photos.length > 0;
 
-        // In photo-only mode, synthesize colour-bearing ghost items so the
-        // existing analysis pipeline has something to work with.
+        // In photo-only mode, synthesize ghost items so the existing analysis
+        // pipeline has something to work with. When the AI returned real
+        // garment categories for a photo, we use those; otherwise we default
+        // to 'tops' which is just enough for colour aggregation.
         if (photoOnly) {
           const photoItems = [];
-          photos.forEach(p => (p.colors || []).forEach(c => {
-            photoItems.push({
-              id: 'photo-' + Math.random().toString(36).slice(2),
-              category: 'tops', name: 'outfit colour', tier: 'decent',
-              color: c, brand: '', occasion: []
+          photos.forEach(p => {
+            const cats = (p.categories && p.categories.length) ? p.categories : ['tops'];
+            const cols = (p.colors && p.colors.length) ? p.colors : ['black'];
+            // Create one ghost per (category, primary colour) so category
+            // counts reflect what's actually in the photos.
+            const primary = cols[0];
+            cats.forEach(cat => {
+              photoItems.push({
+                id: 'photo-' + Math.random().toString(36).slice(2),
+                category: cat,
+                name: 'outfit piece',
+                tier: 'decent',
+                color: primary,
+                brand: '',
+                occasion: []
+              });
             });
-          }));
+            // Also add secondary colours as 'tops' ghost items so they still
+            // appear in the colour donut without inflating category counts.
+            cols.slice(1).forEach(c => {
+              photoItems.push({
+                id: 'photo-' + Math.random().toString(36).slice(2),
+                category: 'tops',
+                name: 'accent colour',
+                tier: 'decent',
+                color: c,
+                brand: '',
+                occasion: []
+              });
+            });
+          });
           state.items = photoItems;
         }
 
@@ -199,9 +225,15 @@
         const pairingsCard = pairingsSection && pairingsSection.nextElementSibling;
 
         if (brandCard) brandCard.style.display = photoOnly ? 'none' : '';
+
+        // Per-category colour donuts: SHOW in photo mode when AI categorised
+        // the photos. Otherwise hide.
+        const photosHaveCategories = photos.some(p => p.categories && p.categories.length);
         if (catColorWrap && catColorWrap.parentElement) {
-          catColorWrap.parentElement.style.display = photoOnly ? 'none' : '';
+          const showPerCat = !photoOnly || photosHaveCategories;
+          catColorWrap.parentElement.style.display = showPerCat ? '' : 'none';
         }
+        // Category & tier chart: needs tier data; hide in photo mode
         if (catChart) {
           const card = catChart.closest('.chart-card');
           if (card) card.style.display = photoOnly ? 'none' : '';
@@ -310,13 +342,20 @@
       const progress = document.getElementById('photoProgress');
       if (progress) progress.style.display = 'block';
 
+      const hasProxy = !!(bridge.AI_PROXY_URL || window.AI_PROXY_URL);
       let done = 0;
       for (const file of files) {
         if (!file.type.startsWith('image/')) { done++; continue; }
-        if (progress) progress.textContent = `Processing ${done + 1} of ${files.length}…`;
+        if (progress) {
+          progress.textContent = hasProxy
+            ? `Analysing photo ${done + 1} of ${files.length} with vision AI…`
+            : `Processing ${done + 1} of ${files.length}…`;
+        }
         try {
           const photo = await processPhoto(file);
           if (photo) state.outfitPhotos.push(photo);
+          // Render after each photo so users see progress
+          renderPhotoGrid();
         } catch (err) {
           console.warn('Photo failed:', file.name, err);
         }
@@ -340,25 +379,131 @@
       const img = new Image();
       await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = dataUrl; });
 
-      const maxDim = 800;
-      const ratio = Math.min(1, maxDim / Math.max(img.width, img.height));
-      const w = Math.max(1, Math.round(img.width * ratio));
-      const h = Math.max(1, Math.round(img.height * ratio));
-      const canvas = document.createElement('canvas');
-      canvas.width = w; canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, w, h);
+      // Two output sizes:
+      // - 800px stored for display
+      // - 600px sent to vision AI (smaller payload, still plenty of detail)
+      const renderCanvas = drawResized(img, 800);
+      const heuristicColors = extractDominantColors(
+        renderCanvas.getContext('2d'),
+        renderCanvas.width,
+        renderCanvas.height
+      );
+      const resized = renderCanvas.toDataURL('image/jpeg', 0.78);
 
-      const colors = extractDominantColors(ctx, w, h);
-      const resized = canvas.toDataURL('image/jpeg', 0.72);
+      // Try real vision AI for accurate clothing colours + garment categories.
+      let aiColors = null, aiCategories = null;
+      try {
+        const visionCanvas = drawResized(img, 600);
+        const visionData = visionCanvas.toDataURL('image/jpeg', 0.72);
+        const ai = await analyzePhotoWithAI(visionData);
+        if (ai) {
+          aiColors = ai.colors;
+          aiCategories = ai.categories;
+        }
+      } catch (e) {
+        console.warn('Vision AI failed for', file.name, '— falling back to heuristic', e);
+      }
 
       return {
         id: uid(),
         filename: file.name,
         image: resized,
-        colors,
+        colors: (aiColors && aiColors.length) ? aiColors : heuristicColors,
+        categories: aiCategories || [],
+        aiAnalyzed: !!aiColors,
         createdAt: Date.now()
       };
+    }
+
+    function drawResized(img, maxDim) {
+      const ratio = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const w = Math.max(1, Math.round(img.width * ratio));
+      const h = Math.max(1, Math.round(img.height * ratio));
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      return canvas;
+    }
+
+    // ─── Vision AI: identify clothing colours + categories ───
+    // Times out after 12 seconds to keep the upload flow snappy.
+    async function analyzePhotoWithAI(dataUrl) {
+      const proxyUrl = bridge.AI_PROXY_URL || window.AI_PROXY_URL;
+      if (!proxyUrl) return null;
+      const m = dataUrl.match(/^data:(image\/[a-z]+);base64,(.+)$/i);
+      if (!m) return null;
+      const media_type = m[1];
+      const data = m[2];
+
+      const colourPalette = COLORS.map(c => c[0]).filter(n => !!n).join(', ');
+      const prompt = `You are looking at a photo of an outfit a person is wearing. Identify:
+
+1. The 1-3 dominant colours of the CLOTHING ONLY. Ignore backgrounds, walls, floors, skin, hair, hands, accessories like sunglasses, and reflections. Use ONLY these exact colour names (no variants): ${colourPalette}.
+
+2. The garment categories visible in the outfit. Pick from these exact strings: tops, bottoms, onePieces, outerwear, shoes. Notes:
+   - "tops" = shirt, blouse, tee, tank, sweater (worn as the top layer alone), blazer-replacement crop top
+   - "bottoms" = pants, jeans, shorts, trousers, skirt
+   - "onePieces" = dress, jumpsuit, romper, gown
+   - "outerwear" = cardigan, sweater (layered over a top), jacket, coat, blazer
+   - "shoes" = anything on the feet
+   - Don't list "outerwear" if the sweater IS the top layer; only when it's clearly over a shirt/top.
+
+Respond as JSON only, no other text or commentary:
+{"colors": ["...", "..."], "categories": ["...", "..."]}`;
+
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('AI timeout')), 12000));
+      const call = (async () => {
+        const res = await fetch(proxyUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt, data: [], images: [{ media_type, data }] })
+        });
+        if (!res.ok) throw new Error('proxy ' + res.status);
+        return res.json();
+      })();
+
+      try {
+        const result = await Promise.race([call, timeout]);
+        const text = (result && result.text) || '';
+        const jm = text.match(/\{[\s\S]*\}/);
+        if (!jm) return null;
+        const parsed = JSON.parse(jm[0]);
+        const colors = Array.isArray(parsed.colors)
+          ? parsed.colors.filter(c => typeof c === 'string').map(normaliseColorName).filter(Boolean).slice(0, 3)
+          : [];
+        const cats = Array.isArray(parsed.categories)
+          ? parsed.categories.filter(c => typeof c === 'string')
+              .map(c => c.trim())
+              .filter(c => ['tops','bottoms','onePieces','outerwear','shoes'].includes(c))
+          : [];
+        return (colors.length || cats.length) ? { colors, categories: cats } : null;
+      } catch (e) {
+        console.warn('analyzePhotoWithAI:', e);
+        return null;
+      }
+    }
+
+    // Map AI-returned colour names back to our exact palette names
+    function normaliseColorName(name) {
+      const s = String(name).toLowerCase().trim();
+      // Direct match
+      for (const [palette] of COLORS) if (palette.toLowerCase() === s) return palette;
+      // Strip common modifiers
+      const stripped = s.replace(/^(light|dark|deep|pale|bright|dusty|soft|hot|pastel)\s+/, '');
+      for (const [palette] of COLORS) if (palette.toLowerCase() === stripped) return palette;
+      // Aliases
+      const map = {
+        'beige': 'cream/beige', 'cream': 'cream/beige', 'ivory': 'cream/beige', 'champagne': 'cream/beige',
+        'gray': 'grey', 'silver': 'metallic', 'gold': 'metallic',
+        'denim': 'denim/light blue', 'light blue': 'denim/light blue',
+        'tan': 'tan/camel', 'camel': 'tan/camel', 'khaki': 'tan/camel',
+        'multi': 'multi/print', 'multicolor': 'multi/print', 'multicolour': 'multi/print',
+        'patterned': 'multi/print', 'pattern': 'multi/print', 'print': 'floral / print',
+        'floral': 'floral / print', 'striped': 'multi/print', 'plaid': 'multi/print'
+      };
+      if (map[s]) return map[s];
+      if (map[stripped]) return map[stripped];
+      return null;
     }
 
     function extractDominantColors(ctx, w, h) {
