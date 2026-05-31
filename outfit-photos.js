@@ -496,38 +496,63 @@
 Respond as JSON only, no other text:
 {"colors": ["...", "..."], "categories": ["...", "..."]}`;
 
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(key)}`;
-      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('AI timeout')), 15000));
+      // Try a sequence of models — Google sometimes deprecates older ones.
+      // The new AQ.-prefixed keys (April 2026 format) work with both the
+      // x-goog-api-key header AND the ?key= query string on the native endpoint.
+      // We send via header which is the more modern convention and works for
+      // both AIza and AQ key formats.
+      const models = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-flash-latest'];
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('AI timeout')), 20000));
+
+      const requestBody = JSON.stringify({
+        contents: [{
+          parts: [
+            { inline_data: { mime_type: mimeType, data: data } },
+            { text: prompt }
+          ]
+        }],
+        generationConfig: { maxOutputTokens: 300, temperature: 0.3 }
+      });
 
       try {
-        const call = fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{
-              parts: [
-                { inline_data: { mime_type: mimeType, data: data } },
-                { text: prompt }
-              ]
-            }],
-            generationConfig: { maxOutputTokens: 300, temperature: 0.3 }
-          })
-        });
+        let res = null, errText = '', lastStatus = 0;
+        for (const model of models) {
+          const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+          const call = fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': key
+            },
+            body: requestBody
+          });
+          res = await Promise.race([call, timeout]);
+          lastStatus = res.status;
+          if (res.ok) break;
+          errText = await res.text();
+          console.warn(`Gemini ${model} returned ${res.status}:`, errText.slice(0, 200));
+          // If it's a model-not-found, try the next one
+          if (res.status === 404) continue;
+          // For auth errors, no point trying other models — same key
+          if (res.status === 400 || res.status === 401 || res.status === 403) break;
+        }
 
-        const res = await Promise.race([call, timeout]);
-        if (!res.ok) {
-          const errText = await res.text();
-          console.warn('Gemini API', res.status, errText);
-          // Bad key — clear it so the user gets re-prompted next session
-          if (res.status === 400 || res.status === 401 || res.status === 403) {
+        if (!res || !res.ok) {
+          // Bad key — clear it so the user gets re-prompted
+          if (lastStatus === 400 || lastStatus === 401 || lastStatus === 403) {
+            console.warn('Gemini rejected the key (will re-prompt). Detail:', errText);
             setGeminiKey('');
           }
           return null;
         }
+
         const json = await res.json();
         const text = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         const jm = text.match(/\{[\s\S]*\}/);
-        if (!jm) return null;
+        if (!jm) {
+          console.warn('Gemini returned no JSON. Full text:', text);
+          return null;
+        }
         const parsed = JSON.parse(jm[0]);
         const colors = Array.isArray(parsed.colors)
           ? parsed.colors.filter(c => typeof c === 'string').map(normaliseColorName).filter(Boolean).slice(0, 3)
