@@ -507,13 +507,19 @@ Respond as JSON only, no other text or commentary:
     }
 
     function extractDominantColors(ctx, w, h) {
-      // Sample only the inner 70% horizontally and 80% vertically of the frame.
-      // Clothing is almost always centred; edges are mostly background.
+      const data = ctx.getImageData(0, 0, w, h).data;
+
+      // ─── Step 1: Learn the background ───
+      // Sample the four corner regions of the photo — these are almost always
+      // background (walls, floors, sky). Cluster their colours into "background
+      // signature" so we can subtract pixels that match them in the main pass.
+      const bgSignature = sampleBackgroundCorners(data, w, h);
+
+      // ─── Step 2: Sample the centre region, excluding background-matching pixels ───
       const padX = Math.floor(w * 0.15);
       const padY = Math.floor(h * 0.10);
-      const data = ctx.getImageData(0, 0, w, h).data;
       const buckets = {};
-      const cx = w / 2, cy = h * 0.55; // bias centre slightly down — clothing sits below the face
+      const cx = w / 2, cy = h * 0.55; // clothing usually sits below the face
       const maxDist = Math.hypot(w / 2, h / 2);
 
       for (let y = padY; y < h - padY; y += 2) {
@@ -526,13 +532,12 @@ Respond as JSON only, no other text or commentary:
           const lum = 0.299 * r + 0.587 * g + 0.114 * b;
           if (lum > 240 || lum < 18) continue;
 
-          // Drop low-saturation light pixels — typical of walls, paper, white furniture
+          // Drop low-saturation light pixels — typical of walls/paper/white furniture
           const max = Math.max(r, g, b), min = Math.min(r, g, b);
           const sat = max ? (max - min) / max : 0;
           if (sat < 0.10 && lum > 160) continue;
 
-          // Skin tone filter — broadly r > g > b with a warm orange-pink cast.
-          // Calibrated against typical skin in well-lit photos across tones.
+          // Skin tone filter
           const isSkin =
             r > g && g >= b &&
             (r - b) > 28 && (r - b) < 130 &&
@@ -541,19 +546,22 @@ Respond as JSON only, no other text or commentary:
             lum > 80 && lum < 230;
           if (isSkin) continue;
 
-          // Centre weighting — pixels near the visual centre count more.
+          // ★ Background subtraction: skip pixels that match a corner sample.
+          // This is the biggest accuracy win — if your room is beige, a beige
+          // wall behind you won't pollute the colour extraction anymore.
+          if (matchesBackground(r, g, b, bgSignature)) continue;
+
+          // Centre weighting
           const dx = (x - cx) / maxDist;
           const dy = (y - cy) / maxDist;
           const dist = Math.sqrt(dx * dx + dy * dy);
           const weight = Math.max(0.25, 1 - dist * 1.2);
 
-          // Quantize into 32-level buckets per channel
           const key = `${r >> 5}|${g >> 5}|${b >> 5}`;
           buckets[key] = (buckets[key] || 0) + weight;
         }
       }
 
-      // Take the top buckets, map each to its nearest named colour, aggregate
       const top = Object.entries(buckets).sort((a, b) => b[1] - a[1]).slice(0, 14);
       const byName = {};
       for (const [key, count] of top) {
@@ -566,6 +574,49 @@ Respond as JSON only, no other text or commentary:
         .sort((a, b) => b[1] - a[1])
         .slice(0, 3)
         .map(e => e[0]);
+    }
+
+    // Sample 4 corner regions (15% × 15% each) and return the dominant colour
+    // clusters found there. These represent the photo's background.
+    function sampleBackgroundCorners(data, w, h) {
+      const regions = [
+        { x0: 0,            y0: 0,            x1: w * 0.18, y1: h * 0.18 }, // top-left
+        { x0: w * 0.82,     y0: 0,            x1: w,         y1: h * 0.18 }, // top-right
+        { x0: 0,            y0: h * 0.82,     x1: w * 0.18, y1: h          }, // bottom-left
+        { x0: w * 0.82,     y0: h * 0.82,     x1: w,         y1: h          }  // bottom-right
+      ];
+      const cornerBuckets = {};
+      for (const reg of regions) {
+        for (let y = Math.floor(reg.y0); y < Math.floor(reg.y1); y += 3) {
+          for (let x = Math.floor(reg.x0); x < Math.floor(reg.x1); x += 3) {
+            const i = (y * w + x) * 4;
+            const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+            if (a < 200) continue;
+            // Quantize coarsely so similar shades cluster
+            const key = `${r >> 4}|${g >> 4}|${b >> 4}`;
+            cornerBuckets[key] = (cornerBuckets[key] || 0) + 1;
+          }
+        }
+      }
+      // Keep the top 6 colour clusters — that's our background signature
+      return Object.entries(cornerBuckets)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 6)
+        .map(([key]) => {
+          const [rq, gq, bq] = key.split('|').map(Number);
+          return { r: rq * 16 + 8, g: gq * 16 + 8, b: bq * 16 + 8 };
+        });
+    }
+
+    // Returns true if (r,g,b) is close to any background sample within a
+    // perceptual distance threshold. Tighter threshold → less aggressive
+    // subtraction (preserves clothing similar in tone to background).
+    function matchesBackground(r, g, b, bgSignature) {
+      for (const bg of bgSignature) {
+        const d = Math.abs(bg.r - r) + Math.abs(bg.g - g) + Math.abs(bg.b - b);
+        if (d < 45) return true;
+      }
+      return false;
     }
 
     function nearestNamedColor(r, g, b) {
