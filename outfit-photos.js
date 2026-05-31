@@ -342,13 +342,13 @@
       const progress = document.getElementById('photoProgress');
       if (progress) progress.style.display = 'block';
 
-      const hasProxy = !!(bridge.AI_PROXY_URL || window.AI_PROXY_URL);
+      const hasAi = !!getGeminiKey();
       let done = 0;
       for (const file of files) {
         if (!file.type.startsWith('image/')) { done++; continue; }
         if (progress) {
-          progress.textContent = hasProxy
-            ? `Analysing photo ${done + 1} of ${files.length} with vision AI…`
+          progress.textContent = hasAi
+            ? `Analysing photo ${done + 1} of ${files.length} with Gemini vision…`
             : `Processing ${done + 1} of ${files.length}…`;
         }
         try {
@@ -425,14 +425,59 @@
       return canvas;
     }
 
-    // ─── Vision AI: identify clothing colours + categories ───
-    // Times out after 12 seconds to keep the upload flow snappy.
+    // ─── Vision AI via Google Gemini (free tier, no proxy needed) ───
+    // The user provides their own API key from aistudio.google.com.
+    // Stored in localStorage and reused; cleared if the API rejects it.
+
+    const GEMINI_KEY_STORAGE = 'idkwtw-gemini-key';
+    const GEMINI_REFUSED_STORAGE = 'idkwtw-gemini-refused'; // user said "no thanks" this session
+
+    function getGeminiKey() {
+      try { return localStorage.getItem(GEMINI_KEY_STORAGE) || ''; }
+      catch (e) { return ''; }
+    }
+    function setGeminiKey(k) {
+      try {
+        if (k) localStorage.setItem(GEMINI_KEY_STORAGE, k);
+        else localStorage.removeItem(GEMINI_KEY_STORAGE);
+      } catch (e) {}
+    }
+    function userRefusedGemini() {
+      try { return sessionStorage.getItem(GEMINI_REFUSED_STORAGE) === '1'; }
+      catch (e) { return false; }
+    }
+    function setUserRefused() {
+      try { sessionStorage.setItem(GEMINI_REFUSED_STORAGE, '1'); } catch (e) {}
+    }
+
+    function promptForGeminiKey() {
+      const existing = getGeminiKey();
+      const msg =
+        'Enable real vision AI for outfit photo analysis?\n\n' +
+        'You\'ll need a free Google Gemini API key (no credit card required):\n' +
+        '  1. Open https://aistudio.google.com\n' +
+        '  2. Sign in with Google → click "Get API key" → "Create API key"\n' +
+        '  3. Paste the key below.\n\n' +
+        'The key stays in your browser and is only sent to Google\'s API.\n' +
+        'Click Cancel to skip and use the colour-only heuristic.';
+      const k = window.prompt(msg, existing);
+      if (k === null || !k.trim()) {
+        setUserRefused();
+        return '';
+      }
+      const trimmed = k.trim();
+      setGeminiKey(trimmed);
+      return trimmed;
+    }
+
     async function analyzePhotoWithAI(dataUrl) {
-      const proxyUrl = bridge.AI_PROXY_URL || window.AI_PROXY_URL;
-      if (!proxyUrl) return null;
+      let key = getGeminiKey();
+      if (!key && !userRefusedGemini()) key = promptForGeminiKey();
+      if (!key) return null;
+
       const m = dataUrl.match(/^data:(image\/[a-z]+);base64,(.+)$/i);
       if (!m) return null;
-      const media_type = m[1];
+      const mimeType = m[1];
       const data = m[2];
 
       const colourPalette = COLORS.map(c => c[0]).filter(n => !!n).join(', ');
@@ -441,30 +486,46 @@
 1. The 1-3 dominant colours of the CLOTHING ONLY. Ignore backgrounds, walls, floors, skin, hair, hands, accessories like sunglasses, and reflections. Use ONLY these exact colour names (no variants): ${colourPalette}.
 
 2. The garment categories visible in the outfit. Pick from these exact strings: tops, bottoms, onePieces, outerwear, shoes. Notes:
-   - "tops" = shirt, blouse, tee, tank, sweater (worn as the top layer alone), blazer-replacement crop top
+   - "tops" = shirt, blouse, tee, tank, sweater (worn as the top layer alone), crop top
    - "bottoms" = pants, jeans, shorts, trousers, skirt
    - "onePieces" = dress, jumpsuit, romper, gown
    - "outerwear" = cardigan, sweater (layered over a top), jacket, coat, blazer
    - "shoes" = anything on the feet
    - Don't list "outerwear" if the sweater IS the top layer; only when it's clearly over a shirt/top.
 
-Respond as JSON only, no other text or commentary:
+Respond as JSON only, no other text:
 {"colors": ["...", "..."], "categories": ["...", "..."]}`;
 
-      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('AI timeout')), 12000));
-      const call = (async () => {
-        const res = await fetch(proxyUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt, data: [], images: [{ media_type, data }] })
-        });
-        if (!res.ok) throw new Error('proxy ' + res.status);
-        return res.json();
-      })();
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(key)}`;
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('AI timeout')), 15000));
 
       try {
-        const result = await Promise.race([call, timeout]);
-        const text = (result && result.text) || '';
+        const call = fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                { inline_data: { mime_type: mimeType, data: data } },
+                { text: prompt }
+              ]
+            }],
+            generationConfig: { maxOutputTokens: 300, temperature: 0.3 }
+          })
+        });
+
+        const res = await Promise.race([call, timeout]);
+        if (!res.ok) {
+          const errText = await res.text();
+          console.warn('Gemini API', res.status, errText);
+          // Bad key — clear it so the user gets re-prompted next session
+          if (res.status === 400 || res.status === 401 || res.status === 403) {
+            setGeminiKey('');
+          }
+          return null;
+        }
+        const json = await res.json();
+        const text = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         const jm = text.match(/\{[\s\S]*\}/);
         if (!jm) return null;
         const parsed = JSON.parse(jm[0]);
