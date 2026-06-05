@@ -2,9 +2,9 @@
 // outfit-photos.js
 //
 // Drop-in plugin that adds a third inventory option to "idk what to wear":
-// users can upload photos of outfits they've already worn. The plugin extracts
-// dominant colours from each photo client-side and feeds them into the existing
-// analysis pipeline.
+// users can upload photos of outfits they've already worn. Photos are sent to
+// Google Gemini for colour + garment-category analysis. Each visitor provides
+// their own Gemini API key (prompted on first photo upload, stored locally).
 //
 // INSTALL (in your index.html):
 //   1. After the const state = { ... }; declaration, add:
@@ -391,10 +391,11 @@
       const resized = renderCanvas.toDataURL('image/jpeg', 0.78);
 
       // Try real vision AI for accurate clothing colours + garment categories.
+      // Send a higher-res copy (1024px) so Gemini sees fine detail.
       let aiColors = null, aiCategories = null;
       try {
-        const visionCanvas = drawResized(img, 600);
-        const visionData = visionCanvas.toDataURL('image/jpeg', 0.72);
+        const visionCanvas = drawResized(img, 1024);
+        const visionData = visionCanvas.toDataURL('image/jpeg', 0.85);
         const ai = await analyzePhotoWithAI(visionData);
         if (ai) {
           aiColors = ai.colors;
@@ -481,28 +482,43 @@
       const data = m[2];
 
       const colourPalette = COLORS.map(c => c[0]).filter(n => !!n).join(', ');
-      const prompt = `You are looking at a photo of an outfit a person is wearing. Identify:
+      // Chain-of-thought prompt: ask Gemini to reason through what it sees
+      // FIRST, then output structured JSON. This dramatically improves
+      // accuracy versus asking for JSON cold.
+      const prompt = `You are a careful fashion analyst looking at a photo of a person wearing an outfit.
 
-1. The 1-3 dominant colours of the CLOTHING ONLY. Ignore backgrounds, walls, floors, skin, hair, hands, accessories like sunglasses, and reflections. Use ONLY these exact colour names (no variants): ${colourPalette}.
+Step 1 — DESCRIBE
+Briefly describe what you see, IN ORDER OF VISIBILITY from top to bottom:
+- Top half: what is the person wearing on their upper body? Be specific about layers (e.g. "white tee under a beige cardigan").
+- Bottom half: what is on their lower body? (e.g. "dark blue straight-leg jeans")
+- Feet: what shoes if visible?
+- Note any accessories you'll ignore (sunglasses, jewellery, bag).
+- Note the background briefly so I know you've separated it from clothing.
 
-2. The garment categories visible in the outfit. Pick from these exact strings: tops, bottoms, onePieces, outerwear, shoes. Notes:
-   - "tops" = shirt, blouse, tee, tank, sweater (worn as the top layer alone), crop top
-   - "bottoms" = pants, jeans, shorts, trousers, skirt
-   - "onePieces" = dress, jumpsuit, romper, gown
-   - "outerwear" = cardigan, sweater (layered over a top), jacket, coat, blazer
-   - "shoes" = anything on the feet
-   - Don't list "outerwear" if the sweater IS the top layer; only when it's clearly over a shirt/top.
+Step 2 — COLOURS
+List the actual dominant colours of the CLOTHING. Be precise — not the wall behind them, not their skin, not their hair, not jewellery, not eyeshadow. If a garment is a particular shade (rust, sage, mustard), choose the closest match from this palette:
+${colourPalette}
 
-Respond as JSON only, no other text:
-{"colors": ["...", "..."], "categories": ["...", "..."]}`;
+Use 1-3 colours total, ordered by how much of the outfit they cover. Don't include colours that only appear in accessories or hair.
 
-      // Try a sequence of models — Google sometimes deprecates older ones.
-      // The new AQ.-prefixed keys (April 2026 format) work with both the
-      // x-goog-api-key header AND the ?key= query string on the native endpoint.
-      // We send via header which is the more modern convention and works for
-      // both AIza and AQ key formats.
-      const models = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-flash-latest'];
-      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('AI timeout')), 20000));
+Step 3 — CATEGORIES
+From what you described, pick the garment categories visible. Choose from EXACTLY these strings:
+- "tops" — shirt, blouse, tee, tank, crop top, OR a sweater/cardigan that IS the top layer (no shirt under it visible)
+- "bottoms" — pants, jeans, shorts, trousers, skirt
+- "onePieces" — dress, jumpsuit, romper, gown (a single garment covering top and bottom)
+- "outerwear" — cardigan, sweater, jacket, coat, blazer worn OVER a visible top
+- "shoes" — anything on the feet
+
+Important: if you see only one upper-body layer (e.g. just a sweater, nothing under it), it's "tops", NOT "outerwear". Outerwear means it's worn over a separate top.
+
+Step 4 — OUTPUT
+End your response with a single JSON object on its own line, exactly this format:
+{"colors": ["colour1", "colour2"], "categories": ["category1", "category2"]}`;
+
+      // gemini-2.5-pro is more accurate at vision than flash. Free tier still
+      // covers ~50 requests/day on pro; we fall back to flash if pro errors.
+      const models = ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-1.5-pro', 'gemini-1.5-flash'];
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('AI timeout')), 30000));
 
       const requestBody = JSON.stringify({
         contents: [{
@@ -511,7 +527,7 @@ Respond as JSON only, no other text:
             { text: prompt }
           ]
         }],
-        generationConfig: { maxOutputTokens: 300, temperature: 0.3 }
+        generationConfig: { maxOutputTokens: 800, temperature: 0.1 }
       });
 
       try {
@@ -548,12 +564,16 @@ Respond as JSON only, no other text:
 
         const json = await res.json();
         const text = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        const jm = text.match(/\{[\s\S]*\}/);
-        if (!jm) {
-          console.warn('Gemini returned no JSON. Full text:', text);
+        // The response is chain-of-thought reasoning followed by JSON. Find
+        // the JSON object containing "colors" — works even if reasoning text
+        // mentions braces. Match the last such object to handle any false
+        // positives in reasoning.
+        const all = [...text.matchAll(/\{[^{}]*"colors"[^{}]*\}/g)];
+        if (!all.length) {
+          console.warn('Gemini returned no parseable JSON. Full text:', text.slice(0, 400));
           return null;
         }
-        const parsed = JSON.parse(jm[0]);
+        const parsed = JSON.parse(all[all.length - 1][0]);
         const colors = Array.isArray(parsed.colors)
           ? parsed.colors.filter(c => typeof c === 'string').map(normaliseColorName).filter(Boolean).slice(0, 3)
           : [];
@@ -574,21 +594,63 @@ Respond as JSON only, no other text:
       const s = String(name).toLowerCase().trim();
       // Direct match
       for (const [palette] of COLORS) if (palette.toLowerCase() === s) return palette;
-      // Strip common modifiers
-      const stripped = s.replace(/^(light|dark|deep|pale|bright|dusty|soft|hot|pastel)\s+/, '');
+      // Strip common modifiers (light blue → blue, etc.) — but only after
+      // checking direct matches so "light blue" can map to denim/light blue
+      const stripped = s.replace(/^(light|dark|deep|pale|bright|dusty|soft|hot|pastel|muted|warm|cool|rich|dull|faded|washed|sun[- ]?faded)\s+/, '');
       for (const [palette] of COLORS) if (palette.toLowerCase() === stripped) return palette;
-      // Aliases
+      // Aliases — covers what vision models commonly call colours
       const map = {
-        'beige': 'cream/beige', 'cream': 'cream/beige', 'ivory': 'cream/beige', 'champagne': 'cream/beige',
-        'gray': 'grey', 'silver': 'metallic', 'gold': 'metallic',
+        // Cream / beige family
+        'beige': 'cream/beige', 'cream': 'cream/beige', 'ivory': 'cream/beige',
+        'champagne': 'cream/beige', 'eggshell': 'cream/beige', 'bone': 'cream/beige',
+        'off-white': 'cream/beige', 'off white': 'cream/beige', 'oat': 'cream/beige',
+        'ecru': 'cream/beige', 'vanilla': 'cream/beige',
+        // White / grey
+        'gray': 'grey', 'charcoal': 'grey', 'slate': 'grey', 'stone': 'grey',
+        'silver': 'metallic', 'gold': 'metallic', 'bronze': 'metallic', 'copper': 'metallic',
+        // Blues
         'denim': 'denim/light blue', 'light blue': 'denim/light blue',
+        'sky blue': 'denim/light blue', 'powder blue': 'denim/light blue',
+        'cobalt': 'blue', 'royal blue': 'blue', 'azure': 'blue', 'sapphire': 'navy',
+        'midnight': 'navy', 'midnight blue': 'navy', 'indigo': 'navy',
+        // Browns
         'tan': 'tan/camel', 'camel': 'tan/camel', 'khaki': 'tan/camel',
+        'chocolate': 'brown', 'espresso': 'brown', 'coffee': 'brown',
+        'rust': 'brown', 'sienna': 'brown', 'mocha': 'brown',
+        'taupe': 'taupe', 'mushroom': 'taupe', 'greige': 'taupe',
+        // Reds / pinks
+        'maroon': 'burgundy', 'wine': 'burgundy', 'oxblood': 'burgundy',
+        'crimson': 'red', 'scarlet': 'red', 'cherry': 'red',
+        'rose': 'pink', 'salmon': 'pink', 'coral': 'pink', 'fuchsia': 'pink',
+        'magenta': 'pink', 'dusty pink': 'blush',
+        // Oranges / yellows
+        'peach': 'orange', 'apricot': 'orange', 'terracotta': 'orange',
+        'mustard': 'mustard', 'amber': 'mustard', 'ochre': 'mustard',
+        'butter': 'yellow', 'lemon': 'yellow', 'gold': 'yellow',
+        // Greens
+        'emerald': 'green', 'forest': 'green', 'kelly green': 'green', 'kelly': 'green',
+        'sage': 'sage', 'mint': 'sage', 'pistachio': 'sage', 'seafoam': 'sage',
+        'olive': 'olive', 'army': 'olive', 'army green': 'olive', 'hunter': 'olive',
+        'teal': 'teal', 'turquoise': 'teal', 'aqua': 'teal',
+        // Purples
+        'violet': 'purple', 'plum': 'purple', 'aubergine': 'purple', 'eggplant': 'purple',
+        'lavender': 'lavender', 'lilac': 'lavender', 'mauve': 'lavender', 'periwinkle': 'lavender',
+        // Prints / multi
         'multi': 'multi/print', 'multicolor': 'multi/print', 'multicolour': 'multi/print',
-        'patterned': 'multi/print', 'pattern': 'multi/print', 'print': 'floral / print',
-        'floral': 'floral / print', 'striped': 'multi/print', 'plaid': 'multi/print'
+        'multi-color': 'multi/print', 'multi-colour': 'multi/print',
+        'patterned': 'multi/print', 'pattern': 'multi/print',
+        'striped': 'multi/print', 'plaid': 'multi/print', 'checked': 'multi/print',
+        'checkered': 'multi/print', 'gingham': 'multi/print', 'tartan': 'multi/print',
+        'print': 'floral / print', 'floral': 'floral / print',
+        'flowery': 'floral / print', 'paisley': 'floral / print'
       };
       if (map[s]) return map[s];
       if (map[stripped]) return map[stripped];
+      // Last resort: find best palette match by substring
+      for (const [palette] of COLORS) {
+        const p = palette.toLowerCase();
+        if (s.includes(p) || p.includes(s)) return palette;
+      }
       return null;
     }
 
